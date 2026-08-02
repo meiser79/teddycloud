@@ -6,6 +6,10 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
+#ifndef _WIN32
+#include <poll.h>
+#endif
 
 #include "toniefile.h"
 #include "handler.h"
@@ -577,6 +581,79 @@ bool toniefile_is_valid(const char *file_path)
     return is_valid;
 }
 
+/* True for sources ffmpeg has to fetch over the network, i.e. everything that
+   can break mid-stream and therefore needs reconnect handling.
+   Instead of maintaining a list of protocols we detect a URL scheme
+   ("scheme://", RFC 3986: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )) and
+   only exclude the schemes that are known to be local. That way every
+   present and future ffmpeg network protocol is covered automatically,
+   while local paths (including Windows "C:\\...", which is not a scheme
+   because it lacks "//") keep the old behaviour. */
+static bool_t scheme_char_is_alpha(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+static bool_t ffmpeg_source_is_network(const char *input_source)
+{
+    if (input_source == NULL)
+    {
+        return false;
+    }
+
+    /* locate the scheme separator without running past the first path char */
+    const char *sep = osStrstr(input_source, "://");
+    if (sep == NULL || sep == input_source)
+    {
+        return false;
+    }
+
+    size_t scheme_len = (size_t)(sep - input_source);
+    if (!scheme_char_is_alpha(input_source[0]))
+    {
+        return false;
+    }
+    for (size_t i = 1; i < scheme_len; i++)
+    {
+        char c = input_source[i];
+        if (!scheme_char_is_alpha(c) && !(c >= '0' && c <= '9') && c != '+' && c != '-' && c != '.')
+        {
+            return false;
+        }
+    }
+
+    /* schemes that never touch the network */
+    static const char *local_schemes[] = {"file", "pipe", "fd", "cache", "subfile", "concat", "crypto", "data"};
+    for (size_t i = 0; i < sizeof(local_schemes) / sizeof(local_schemes[0]); i++)
+    {
+        if (osStrlen(local_schemes[i]) == scheme_len &&
+            osStrncasecmp(input_source, local_schemes[i], scheme_len) == 0)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/* The reconnect/timeout options used below are PRIVATE options of ffmpeg's
+   http protocol. Passing them for any other scheme (rtsp://, srt://, ...) or
+   to an ffmpeg build that does not know them makes ffmpeg abort right away
+   with "Option ... not found": the pipe opens, but not a single sample ever
+   arrives. So gate them on http/https, and keep the generic network check
+   above for the reconnect logic itself.
+   NOTE: -http_seekable was removed in ffmpeg 8.x and must not be used. Every
+   remaining option below was verified against ffmpeg 4.x .. 8.0. */
+static bool_t ffmpeg_source_is_http(const char *input_source)
+{
+    if (input_source == NULL)
+    {
+        return false;
+    }
+    return osStrncasecmp(input_source, "http://", 7) == 0 ||
+           osStrncasecmp(input_source, "https://", 8) == 0;
+}
+
 // Function to decode audio from FFmpeg's standard output
 FILE *ffmpeg_decode_audio_start(const char *input_source)
 {
@@ -592,7 +669,18 @@ FILE *ffmpeg_decode_audio_start_skip(const char *input_source, size_t skip_secon
     char ffmpeg_command[1024]; // Adjust the buffer size as needed
     if (skip_bytes == 0)
     {
-        snprintf(ffmpeg_command, sizeof(ffmpeg_command), "ffmpeg -i \"%s\" -f s16le -acodec pcm_s16le -ar 48000 -ac 2 -ss %" PRIuSIZE " -", input_source, skip_seconds);
+        /* Network sources (webradio) must survive short outages. Without these
+           flags ffmpeg terminates on the first TCP hiccup, DNS flap or 5xx of
+           the icecast/shoutcast server, which kills the whole stream.
+           Only options that exist in ffmpeg 4.x too are used here; an unknown
+           option makes ffmpeg exit before producing any output. */
+        const char *net_opts = ffmpeg_source_is_http(input_source)
+                                   ? "-reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 "
+                                     "-reconnect_delay_max 30 -rw_timeout 15000000 "
+                                     "-reconnect_on_http_error 4xx,5xx "
+                                     "-icy 0 "
+                                   : "";
+        snprintf(ffmpeg_command, sizeof(ffmpeg_command), "ffmpeg %s-i \"%s\" -f s16le -acodec pcm_s16le -ar 48000 -ac 2 -ss %" PRIuSIZE " -", net_opts, input_source, skip_seconds);
     }
     else
     {
@@ -664,6 +752,56 @@ error_t ffmpeg_decode_audio_end(FILE *ffmpeg_pipe, error_t error)
 
 error_t ffmpeg_decode_audio(FILE *ffmpeg_pipe, int16_t *buffer, size_t size, size_t *blocks_read)
 {
+    return ffmpeg_decode_audio_timeout(ffmpeg_pipe, buffer, size, blocks_read, 0);
+}
+
+/* Wait until the ffmpeg pipe is readable. Returns ERROR_TIMEOUT if no data
+   showed up in time, so the caller can tear the pipe down and reconnect
+   instead of blocking in fread() forever (frozen stream, no EOF). */
+static error_t ffmpeg_pipe_wait_readable(FILE *ffmpeg_pipe, uint32_t timeout_ms)
+{
+#ifndef _WIN32
+    if (timeout_ms == 0)
+    {
+        return NO_ERROR;
+    }
+
+    int fd = fileno(ffmpeg_pipe);
+    if (fd < 0)
+    {
+        return NO_ERROR;
+    }
+
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    while (true)
+    {
+        int ret = poll(&pfd, 1, (int)timeout_ms);
+        if (ret > 0)
+        {
+            return NO_ERROR;
+        }
+        if (ret == 0)
+        {
+            return ERROR_TIMEOUT;
+        }
+        if (errno != EINTR)
+        {
+            return NO_ERROR; /* let fread() report the real condition */
+        }
+    }
+#else
+    (void)ffmpeg_pipe;
+    (void)timeout_ms;
+    return NO_ERROR;
+#endif
+}
+
+error_t ffmpeg_decode_audio_timeout(FILE *ffmpeg_pipe, int16_t *buffer, size_t size, size_t *blocks_read, uint32_t timeout_ms)
+{
     if (ffmpeg_pipe == NULL)
         return ERROR_ABORTED;
 
@@ -675,6 +813,17 @@ error_t ffmpeg_decode_audio(FILE *ffmpeg_pipe, int16_t *buffer, size_t size, siz
         // Determine how many samples to read in the current iteration
         size_t remaining_samples = size - *blocks_read;
         size_t samples_to_read = (remaining_samples < chunk_size) ? remaining_samples : chunk_size;
+
+        /* Only guard the first read of a block: once ffmpeg started delivering
+           the block, a short read is normal and must not trip the watchdog. */
+        if (*blocks_read == 0)
+        {
+            error_t wait_error = ffmpeg_pipe_wait_readable(ffmpeg_pipe, timeout_ms);
+            if (wait_error == ERROR_TIMEOUT)
+            {
+                return ERROR_TIMEOUT;
+            }
+        }
 
         // Read a chunk of audio data from the pipe
         size_t read = fread(&buffer[*blocks_read], sizeof(int16_t), samples_to_read, ffmpeg_pipe);
@@ -754,10 +903,69 @@ error_t ffmpeg_stream(char source[99][PATH_LEN], size_t source_len, size_t *curr
     size_t samples = sizeof(sample_buffer) / sizeof(uint16_t);
     size_t blocks_read = 0;
 
+    /* Reconnect handling: only meaningful for live network sources. A local
+       file that stops delivering data is really at its end. */
+    bool_t can_reconnect = isStream && ffmpeg_source_is_network(source[*current_source]);
+    uint32_t max_retries = can_reconnect ? get_settings()->encode.stream_reconnect_attempts : 0;
+    uint32_t retry_delay_ms = get_settings()->encode.stream_reconnect_delay_ms;
+    uint32_t read_timeout_ms = can_reconnect ? get_settings()->encode.stream_read_timeout_ms : 0;
+    uint32_t retry_count = 0;
+
     *active = true;
     while (*active)
     {
-        error = ffmpeg_decode_audio(ffmpeg_pipe, sample_buffer, samples, &blocks_read);
+        error = ffmpeg_decode_audio_timeout(ffmpeg_pipe, sample_buffer, samples, &blocks_read, read_timeout_ms);
+
+        /* A stalled or broken network stream is recoverable: drop the pipe and
+           let ffmpeg dial back in instead of ending the stream for the box. */
+        if (can_reconnect && retry_count < max_retries &&
+            (error == ERROR_TIMEOUT || (error == ERROR_END_OF_STREAM && blocks_read == 0 && *current_source + 1 >= source_len)))
+        {
+            uint32_t backoff_ms = retry_delay_ms << (retry_count > 4 ? 4 : retry_count);
+            if (backoff_ms > 30000)
+            {
+                backoff_ms = 30000;
+            }
+            retry_count++;
+            TRACE_WARNING("Stream interrupted (%s), reconnecting in %" PRIu32 "ms (attempt %" PRIu32 "/%" PRIu32 ")\r\n",
+                          error2text(error), backoff_ms, retry_count, max_retries);
+
+            ffmpeg_decode_audio_end(ffmpeg_pipe, error);
+            ffmpeg_pipe = NULL;
+
+            /* Stay responsive to an abort while backing off. */
+            for (uint32_t waited = 0; waited < backoff_ms && *active; waited += 100)
+            {
+                osDelayTask(100);
+            }
+            if (!(*active))
+            {
+                error = NO_ERROR;
+                break;
+            }
+
+            ffmpeg_pipe = ffmpeg_decode_audio_start_skip(source[*current_source], 0, 0);
+            if (ffmpeg_pipe == NULL)
+            {
+                TRACE_ERROR("Reconnect failed, giving up on stream\r\n");
+                error = ERROR_ABORTED;
+                break;
+            }
+            error = NO_ERROR;
+            continue;
+        }
+
+        if (error == NO_ERROR && blocks_read > 0)
+        {
+            retry_count = 0; /* data flowing again */
+        }
+
+        if (error == ERROR_TIMEOUT)
+        {
+            TRACE_ERROR("Stream stalled and reconnect attempts exhausted\r\n");
+            break;
+        }
+
         if (error != NO_ERROR && error != ERROR_END_OF_STREAM)
         {
             TRACE_ERROR("Could not decode sample error=%s read=%" PRIuSIZE "\r\n", error2text(error), blocks_read);

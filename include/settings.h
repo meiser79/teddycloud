@@ -110,6 +110,10 @@ typedef struct
     bool ffmpeg_sweep_startup_buffer;
     uint32_t ffmpeg_sweep_delay_ms;
     uint32_t stream_max_size;
+    uint32_t stream_reconnect_attempts;
+    uint32_t stream_reconnect_delay_ms;
+    uint32_t stream_read_timeout_ms;
+    uint32_t stream_stall_timeout_ms;
     bool use_frontend;
 
 } settings_encode_t;

@@ -1164,6 +1164,10 @@ error_t httpSendResponseStreamUnsafe(HttpConnection *connection, const char_t *u
    }
 
 #if (HTTP_SERVER_FS_SUPPORT == ENABLED)
+   // Timestamp of the first fruitless read while tailing a growing stream file
+   systime_t stream_wait_start = 0;
+   // Set as soon as the first payload byte was handed to the box
+   bool_t stream_data_seen = FALSE;
    // Send response body
    while (length > 0)
    {
@@ -1193,14 +1197,38 @@ error_t httpSendResponseStreamUnsafe(HttpConnection *connection, const char_t *u
       // End of input stream?
       if (isStream && error == ERROR_END_OF_FILE && connection->private.client_ctx.state->box.stream_ctx.active)
       {
+         /* The TAF is still being written by the encoder task. Wait for more
+            data, but once the box has already received audio, give up after
+            stream_stall_timeout_ms so a dead upstream no longer keeps the box
+            hanging on a silent connection forever.
+
+            Before the very first byte was sent we keep waiting: ffmpeg may
+            still be connecting, sweeping its startup buffer or reconnecting.
+            That phase is guarded by the encoder task itself, which clears the
+            active flag when it finally gives up - which ends this loop too. */
+         uint32_t stall_timeout = get_settings()->encode.stream_stall_timeout_ms;
+         if (stall_timeout > 0 && stream_data_seen)
+         {
+            if (stream_wait_start == 0)
+            {
+               stream_wait_start = osGetSystemTime();
+            }
+            else if ((osGetSystemTime() - stream_wait_start) > stall_timeout)
+            {
+               TRACE_WARNING("Stream stalled for more than %" PRIu32 "ms, closing connection\r\n", stall_timeout);
+               error = ERROR_TIMEOUT;
+               break;
+            }
+         }
          osDelayTask(100);
-         error = httpCloseStream(connection); // Test connection??? won't work TODO: exit after some seconds
+         error = httpCloseStream(connection); // Test connection
          if (error)
             break;
          // Clear the sticky stdio EOF indicator so the next read sees appended blocks
          fsSeekFile(file, 0, FS_SEEK_CUR);
          continue;
       }
+      stream_wait_start = 0;
       if (error)
          break;
 
@@ -1209,6 +1237,11 @@ error_t httpSendResponseStreamUnsafe(HttpConnection *connection, const char_t *u
       // Any error to report?
       if (error)
          break;
+
+      if (n > 0)
+      {
+         stream_data_seen = TRUE;
+      }
 
       if (taf_chapter_split)
       {
